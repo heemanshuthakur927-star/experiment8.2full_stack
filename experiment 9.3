@@ -1,0 +1,633 @@
+# Full‑Stack AWS Deployment with Load Balancing (Terraform + GitHub Actions)
+
+This single doc gives you:
+- **AWS architecture**: VPC (public + private), ALB, ECS Fargate (Node/Express API), ECR, S3 + CloudFront (React UI), optional RDS.
+- **Terraform IaC** to provision infra.
+- **GitHub Actions** to build & push Docker images and deploy API to ECS + upload UI to S3 & invalidate CloudFront.
+
+> Cost-saving defaults: 1 NAT Gateway, Fargate spot optional. Adjust for prod.
+
+---
+
+## 1) Directory structure
+```
+infra/
+  terraform/
+    providers.tf
+    variables.tf
+    vpc.tf
+    security.tf
+    alb.tf
+    ecr.tf
+    ecs.tf
+    s3_cloudfront.tf
+    rds.tf        # optional
+    outputs.tf
+.github/workflows/
+  aws-deploy.yml
+api/
+  Dockerfile
+web/
+  Dockerfile
+```
+
+---
+
+## 2) Terraform
+
+### providers.tf
+```hcl
+terraform {
+  required_version = ">= 1.6"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+```
+
+### variables.tf
+```hcl
+variable "project"     { type = string  default = "rbac-app" }
+variable "aws_region"  { type = string  default = "ap-south-1" }
+variable "vpc_cidr"    { type = string  default = "10.0.0.0/16" }
+variable "public_cidrs"  { type = list(string) default = ["10.0.0.0/24", "10.0.1.0/24"] }
+variable "private_cidrs" { type = list(string) default = ["10.0.10.0/24", "10.0.11.0/24"] }
+variable "container_port" { type = number default = 3000 }
+variable "desired_count"  { type = number default = 2 }
+variable "enable_rds"     { type = bool   default = false }
+```
+
+### vpc.tf
+```hcl
+resource "aws_vpc" "main" { cidr_block = var.vpc_cidr tags = { Name = "${var.project}-vpc" } }
+
+resource "aws_internet_gateway" "igw" { vpc_id = aws_vpc.main.id }
+
+# Public subnets
+resource "aws_subnet" "public" {
+  for_each          = toset([0,1])
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.public_cidrs[each.key]
+  map_public_ip_on_launch = true
+  availability_zone = data.aws_availability_zones.available.names[each.key]
+  tags = { Name = "${var.project}-public-${each.key}" }
+}
+
+# Private subnets
+resource "aws_subnet" "private" {
+  for_each          = toset([0,1])
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.private_cidrs[each.key]
+  availability_zone = data.aws_availability_zones.available.names[each.key]
+  tags = { Name = "${var.project}-private-${each.key}" }
+}
+
+data "aws_availability_zones" "available" {}
+
+# NAT (1 AZ to save cost)
+resource "aws_eip" "nat" { domain = "vpc" }
+resource "aws_nat_gateway" "nat" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
+  depends_on    = [aws_internet_gateway.igw]
+}
+
+# Route tables
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+  route { cidr_block = "0.0.0.0/0" gateway_id = aws_internet_gateway.igw.id }
+}
+resource "aws_route_table_association" "public" {
+  for_each       = aws_subnet.public
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table" "private" { vpc_id = aws_vpc.main.id }
+resource "aws_route" "private_inet" {
+  route_table_id         = aws_route_table.private.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.nat.id
+}
+resource "aws_route_table_association" "private" {
+  for_each       = aws_subnet.private
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.private.id
+}
+```
+
+### security.tf
+```hcl
+# ALB SG: open 80 (add 443 + cert in prod)
+resource "aws_security_group" "alb" {
+  name   = "${var.project}-alb-sg"
+  vpc_id = aws_vpc.main.id
+  ingress { from_port = 80 to_port = 80 protocol = "tcp" cidr_blocks = ["0.0.0.0/0"] }
+  egress  { from_port = 0  to_port = 0  protocol = "-1" cidr_blocks = ["0.0.0.0/0"] }
+}
+
+# Service SG: only from ALB
+resource "aws_security_group" "svc" {
+  name   = "${var.project}-svc-sg"
+  vpc_id = aws_vpc.main.id
+  ingress {
+    from_port       = var.container_port
+    to_port         = var.container_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+  egress { from_port = 0 to_port = 0 protocol = "-1" cidr_blocks = ["0.0.0.0/0"] }
+}
+
+# (Optional) RDS SG allowing from service
+resource "aws_security_group" "db" {
+  count  = var.enable_rds ? 1 : 0
+  name   = "${var.project}-db-sg"
+  vpc_id = aws_vpc.main.id
+  ingress { from_port = 5432 to_port = 5432 protocol = "tcp" security_groups = [aws_security_group.svc.id] }
+  egress  { from_port = 0 to_port = 0 protocol = "-1" cidr_blocks = ["0.0.0.0/0"] }
+}
+```
+
+### alb.tf
+```hcl
+resource "aws_lb" "app" {
+  name               = "${var.project}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = [for s in aws_subnet.public : s.id]
+}
+
+resource "aws_lb_target_group" "api" {
+  name        = "${var.project}-tg"
+  port        = var.container_port
+  protocol    = "HTTP"
+  target_type = "ip"
+  vpc_id      = aws_vpc.main.id
+  health_check { path = "/health" matcher = "200-399" interval = 30 }
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.app.arn
+  port              = 80
+  protocol          = "HTTP"
+  default_action { type = "forward" target_group_arn = aws_lb_target_group.api.arn }
+}
+```
+
+### ecr.tf
+```hcl
+resource "aws_ecr_repository" "api" {
+  name = "${var.project}-api"
+  image_scanning_configuration { scan_on_push = true }
+}
+resource "aws_ecr_repository" "web" {
+  name = "${var.project}-web"
+  image_scanning_configuration { scan_on_push = true }
+}
+```
+
+### ecs.tf (Fargate API)
+```hcl
+resource "aws_ecs_cluster" "this" { name = "${var.project}-cluster" }
+
+resource "aws_iam_role" "task_exec" {
+  name = "${var.project}-task-exec"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{ Effect = "Allow", Principal = { Service = "ecs-tasks.amazonaws.com" }, Action = "sts:AssumeRole" }]
+  })
+}
+resource "aws_iam_role_policy_attachment" "task_exec_attach" {
+  role       = aws_iam_role.task_exec.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+locals {
+  api_image = "${aws_ecr_repository.api.repository_url}:latest"
+}
+
+resource "aws_ecs_task_definition" "api" {
+  family                   = "${var.project}-api"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = 256
+  memory                   = 512
+  execution_role_arn       = aws_iam_role.task_exec.arn
+  container_definitions    = jsonencode([
+    {
+      name  : "api",
+      image : local.api_image,
+      portMappings : [{ containerPort : var.container_port, protocol : "tcp" }],
+      essential : true,
+      environment : [
+        { name : "NODE_ENV", value : "production" },
+        # { name : "DATABASE_URL", value : "postgres://..." }
+      ],
+      healthCheck : { command: ["CMD-SHELL", "curl -f http://localhost:${var.container_port}/health || exit 1"], interval: 30, retries: 3, startPeriod: 10, timeout: 5 },
+      logConfiguration : { logDriver : "awslogs", options : { "awslogs-group" : "/ecs/${var.project}", "awslogs-region" : var.aws_region, "awslogs-stream-prefix" : "api" } }
+    }
+  ])
+}
+
+resource "aws_cloudwatch_log_group" "ecs" { name = "/ecs/${var.project}" retention_in_days = 14 }
+
+resource "aws_ecs_service" "api" {
+  name            = "${var.project}-svc"
+  cluster         = aws_ecs_cluster.this.id
+  task_definition = aws_ecs_task_definition.api.arn
+  desired_count   = var.desired_count
+  launch_type     = "FARGATE"
+  network_configuration {
+    subnets         = [for s in aws_subnet.private : s.id]
+    security_groups = [aws_security_group.svc.id]
+    assign_public_ip = false
+  }
+  load_balancer {
+    target_group_arn = aws_lb_target_group.api.arn
+    container_name   = "api"
+    container_port   = var.container_port
+  }
+  lifecycle { ignore_changes = [task_definition] }
+}
+```
+
+### s3_cloudfront.tf (React UI)
+```hcl
+resource "aws_s3_bucket" "web" { bucket = "${var.project}-${random_id.suffix.hex}" }
+resource "random_id" "suffix" { byte_length = 4 }
+
+resource "aws_s3_bucket_ownership_controls" "web" { bucket = aws_s3_bucket.web.id rule { object_ownership = "BucketOwnerPreferred" } }
+resource "aws_s3_bucket_public_access_block" "web" { bucket = aws_s3_bucket.web.id block_public_acls = true block_public_policy = true restrict_public_buckets = true ignore_public_acls = true }
+
+resource "aws_cloudfront_origin_access_control" "oac" {
+  name                              = "${var.project}-oac"
+  description                       = "OAC for S3 web"
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+
+resource "aws_cloudfront_distribution" "cdn" {
+  enabled = true
+  origin {
+    domain_name              = aws_s3_bucket.web.bucket_regional_domain_name
+    origin_id                = "s3-web"
+    origin_access_control_id = aws_cloudfront_origin_access_control.oac.id
+  }
+  default_cache_behavior {
+    target_origin_id       = "s3-web"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD"]
+    cached_methods         = ["GET", "HEAD"]
+    forwarded_values { query_string = false cookies { forward = "none" } }
+  }
+  default_root_object = "index.html"
+  restrictions { geo_restriction { restriction_type = "none" } }
+  viewer_certificate { cloudfront_default_certificate = true }
+}
+
+# Bucket policy for OAC
+data "aws_iam_policy_document" "s3_oac" {
+  statement {
+    actions   = ["s3:GetObject"]
+    resources = ["${aws_s3_bucket.web.arn}/*"]
+    principals { type = "Service" identifiers = ["cloudfront.amazonaws.com"] }
+    condition { test = "StringEquals" variable = "AWS:SourceArn" values = [aws_cloudfront_distribution.cdn.arn] }
+  }
+}
+resource "aws_s3_bucket_policy" "web" { bucket = aws_s3_bucket.web.id policy = data.aws_iam_policy_document.s3_oac.json }
+```
+
+### rds.tf (optional Postgres)
+```hcl
+resource "aws_db_subnet_group" "db" {
+  count      = var.enable_rds ? 1 : 0
+  name       = "${var.project}-db-subnets"
+  subnet_ids = [for s in aws_subnet.private : s.id]
+}
+resource "aws_db_instance" "pg" {
+  count                = var.enable_rds ? 1 : 0
+  identifier           = "${var.project}-pg"
+  engine               = "postgres"
+  instance_class       = "db.t4g.micro"
+  allocated_storage    = 20
+  username             = "appuser"
+  password             = "ChangeMeStrong!" # use Secrets Manager for prod
+  db_subnet_group_name = aws_db_subnet_group.db[0].name
+  vpc_security_group_ids = [aws_security_group.db[0].id]
+  skip_final_snapshot  = true
+}
+```
+
+### outputs.tf
+```hcl
+output "alb_dns" { value = aws_lb.app.dns_name }
+output "cloudfront_domain" { value = aws_cloudfront_distribution.cdn.domain_name }
+output "ecr_api" { value = aws_ecr_repository.api.repository_url }
+output "ecr_web" { value = aws_ecr_repository.web.repository_url }
+```
+
+---
+
+## 3) API & Web Dockerfiles
+
+### api/Dockerfile (Node/Express)
+```dockerfile
+FROM node:18-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+
+FROM node:18-alpine AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build || echo "skip if not TS"
+
+FROM node:18-alpine
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=build /app .
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+### web/Dockerfile (React, optional — we actually deploy to S3)
+```dockerfile
+FROM node:18-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+# image not strictly used; CI will upload /app/build to S3
+```
+
+---
+
+## 4) GitHub Actions: Build, Push, Deploy
+File: `.github/workflows/aws-deploy.yml`
+```yaml
+name: AWS Fullstack Deploy
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: ap-south-1
+      PROJECT: rbac-app
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      # ----- Infra (Terraform) -----
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform init & apply
+        working-directory: infra/terraform
+        run: |
+          terraform init -upgrade
+          terraform apply -auto-approve \
+            -var="project=${{ env.PROJECT }}" \
+            -var="aws_region=${{ env.AWS_REGION }}"
+
+      - name: Read outputs
+        id: tf
+        working-directory: infra/terraform
+        run: |
+          echo "alb=$(terraform output -raw alb_dns)" >> $GITHUB_OUTPUT
+          echo "ecr_api=$(terraform output -raw ecr_api)" >> $GITHUB_OUTPUT
+          echo "ecr_web=$(terraform output -raw ecr_web)" >> $GITHUB_OUTPUT
+          echo "cf=$(terraform output -raw cloudfront_domain)" >> $GITHUB_OUTPUT
+
+      # ----- Build & Push API to ECR -----
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build API image
+        working-directory: api
+        run: |
+          docker build -t ${{ steps.tf.outputs.ecr_api }}:latest .
+          docker push ${{ steps.tf.outputs.ecr_api }}:latest
+
+      # ----- Update ECS service (new task def from image) -----
+      - name: Register new task definition
+        id: task
+        run: |
+          FAMILY="${{ env.PROJECT }}-api"
+          IMAGE="${{ steps.tf.outputs.ecr_api }}:latest"
+          cat > taskdef.json <<EOF
+          {
+            "family": "${env.PROJECT}-api",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": "$(aws iam get-role --role-name ${env.PROJECT}-task-exec --query Role.Arn --output text)",
+            "containerDefinitions": [
+              {
+                "name": "api",
+                "image": "${IMAGE}",
+                "essential": true,
+                "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
+                "logConfiguration": {"logDriver": "awslogs", "options": {"awslogs-group": "/ecs/${env.PROJECT}", "awslogs-region": "${{ env.AWS_REGION }}", "awslogs-stream-prefix": "api"}}
+              }
+            ]
+          }
+          EOF
+          REV=$(aws ecs register-task-definition --cli-input-json file://taskdef.json --query taskDefinition.taskDefinitionArn --output text)
+          echo "td=$REV" >> $GITHUB_OUTPUT
+
+      - name: Update service
+        run: |
+          CLUSTER="${{ env.PROJECT }}-cluster"
+          SERVICE="${{ env.PROJECT }}-svc"
+          aws ecs update-service --cluster $CLUSTER --service $SERVICE --task-definition "${{ steps.task.outputs.td }}"
+
+      # ----- Build Web and Upload to S3 + Invalidate CF -----
+      - name: Build web
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Sync to S3
+        run: |
+          BUCKET=$(aws s3 ls | awk '/${{ env.PROJECT }}-/{print $3}' | head -n1)
+          aws s3 sync web/build s3://$BUCKET --delete
+
+      - name: Invalidate CloudFront
+        run: |
+          DIST_ID=$(aws cloudfront list-distributions --query "DistributionList.Items[?DomainName=='${{ steps.tf.outputs.cf }}'].Id | [0]" --output text)
+          aws cloudfront create-invalidation --distribution-id $DIST_ID --paths "/*"
+
+      - name: Show endpoints
+        run: |
+          echo "API via ALB: http://${{ steps.tf.outputs.alb }}" 
+          echo "Web via CloudFront: https://${{ steps.tf.outputs.cf }}"
+```
+
+> **Secrets/Setup needed**
+> - Create an IAM role for GitHub OIDC and put its ARN into `AWS_OIDC_ROLE_ARN` secret.
+> - Optionally pin Terraform state to S3/DynamoDB (remote backend) for team use.
+
+---
+
+## 5) App expectations
+- **API** must expose `GET /health` → 200 for ALB health checks.
+- Ensure API listens on `0.0.0.0:${container_port}`.
+- **Web** uses React static build uploaded to S3; CloudFront serves it globally.
+
+---
+
+## 6) TLS & domains (fast path)
+- Request ACM cert in us-east-1 for CloudFront, and in your region for ALB.
+- Add Route53 records: `A/AAAA` alias to ALB; `A/AAAA` alias to CloudFront.
+- Update: add HTTPS listeners and redirect 80→443 on ALB; set `viewer_certificate` with your ACM cert on CF.
+
+---
+
+## 7) Scale & resilience
+- Increase `desired_count`, add ECS autoscaling policies on CPU/Memory.
+- Turn on ALB access logs & WAF.
+- Use Secrets Manager/SSM for DB creds; rotate regularly.
+- For true HA, use 2 NATs (one per AZ), multiple AZs for RDS with Multi-AZ.
+
+---
+
+## 8) Local testing commands
+```bash
+# Terraform
+cd infra/terraform
+terraform init
+terraform apply -auto-approve
+
+# Build and push API manually (if needed)
+ECR=$(terraform output -raw ecr_api)
+docker build -t $ECR:latest ./../../api
+docker push $ECR:latest
+```
+
+You now have a reproducible **full‑stack AWS deployment with an Application Load Balancer** in front of your ECS API and a **global CDN** for your React UI.
+
+
+---
+
+## 9) Add HTTPS + Custom Domains (ALB & CloudFront)
+
+### ALB (API over HTTPS)
+```hcl
+# In security.tf add 443 to ALB SG
+resource "aws_security_group_rule" "alb_https_in" {
+  type              = "ingress"
+  security_group_id = aws_security_group.alb.id
+  from_port         = 443
+  to_port           = 443
+  protocol          = "tcp"
+  cidr_blocks       = ["0.0.0.0/0"]
+}
+
+# In alb.tf add HTTPS listener
+resource "aws_acm_certificate" "alb_cert" {
+  domain_name       = var.alb_domain
+  validation_method = "DNS"
+}
+resource "aws_route53_record" "alb_cert_validation" {
+  for_each = { for dvo in aws_acm_certificate.alb_cert.domain_validation_options : dvo.domain_name => { name = dvo.resource_record_name, record = dvo.resource_record_value, type = dvo.resource_record_type } }
+  zone_id = var.route53_zone_id
+  name    = each.value.name
+  type    = each.value.type
+  records = [each.value.record]
+  ttl     = 60
+}
+resource "aws_acm_certificate_validation" "alb_cert_validation" {
+  certificate_arn         = aws_acm_certificate.alb_cert.arn
+  validation_record_fqdns = [for r in aws_route53_record.alb_cert_validation : r.fqdn]
+}
+
+resource "aws_lb_listener" "https" {
+  load_balancer_arn = aws_lb.app.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-2016-08"
+  certificate_arn   = aws_acm_certificate_validation.alb_cert_validation.certificate_arn
+  default_action { type = "forward" target_group_arn = aws_lb_target_group.api.arn }
+}
+
+# Optional: redirect 80 -> 443
+resource "aws_lb_listener" "http_redirect" {
+  load_balancer_arn = aws_lb.app.arn
+  port              = 80
+  protocol          = "HTTP"
+  default_action { type = "redirect" redirect { port = "443" protocol = "HTTPS" status_code = "HTTP_301" } }
+}
+
+# Route53 A record to ALB
+resource "aws_route53_record" "alb_alias" {
+  zone_id = var.route53_zone_id
+  name    = var.alb_domain
+  type    = "A"
+  alias { name = aws_lb.app.dns_name zone_id = aws_lb.app.zone_id evaluate_target_health = false }
+}
+```
+
+**Variables to add** in `variables.tf`:
+```hcl
+variable "route53_zone_id" { type = string }
+variable "alb_domain"      { type = string }   # e.g. api.example.com
+```
+
+### CloudFront (UI over HTTPS + custom domain)
+```hcl
+resource "aws_acm_certificate" "cf_cert" {
+  provider          = aws.us_east_1
+  domain_name       = var.cdn_domain  # e.g. app.example.com
+  validation_method = "DNS"
+}
+
+# Route53 record for cert validation (us-east-1)
+resource "aws_route53_record" "cf_cert_validation" {
+  for_each = { for dvo in aws_acm_certificate.cf_cert.domain_validation_options : dvo.domain_name => { name = dvo.resource_record_name, record = dvo.resource_record_value, type = dvo.resource_record_type } }
+  zone_id = var.route53_zone_id
+  name    = each.value.name
+  type    = each.value.type
+  records = [each.value.record]
+  ttl     = 60
+}
+resource "aws_acm_certificate_validation" "cf_cert_validation" {
+  provider                = aws.us_east_1
+  certificate_arn         = aws_acm_certificate.cf_cert.arn
+  validation_record_fqdns = [for r in aws_route53_record.cf_cert_validation : r.fqdn]
+}
+
+# Update CloudFront distro
+resource "aws_cloudfront_distribution" "cdn" {
+  # ... existing config
