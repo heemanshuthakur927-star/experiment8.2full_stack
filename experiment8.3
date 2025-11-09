@@ -1,0 +1,135 @@
+import { useState, useEffect } from "react";
+import { BrowserRouter as Router, Routes, Route, Navigate, useNavigate } from "react-router-dom";
+
+// -------------------------
+// Fake JWT Helper Functions
+// -------------------------
+function fakeLoginAPI(email, password) {
+  return new Promise((resolve, reject) => {
+    setTimeout(() => {
+      if (email === "user@example.com" && password === "password123") {
+        const fakeJWT = btoa(JSON.stringify({ email, exp: Date.now() + 60 * 60 * 1000 })); // 1 hr expiry
+        resolve(fakeJWT);
+      } else reject("Invalid credentials");
+    }, 1000);
+  });
+}
+
+function verifyJWT(token) {
+  try {
+    const decoded = JSON.parse(atob(token));
+    if (decoded.exp < Date.now()) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// -------------------------
+// Login Component
+// -------------------------
+function Login() {
+  const [form, setForm] = useState({ email: "", password: "" });
+  const [error, setError] = useState("");
+  const navigate = useNavigate();
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setError("");
+    try {
+      const token = await fakeLoginAPI(form.email, form.password);
+      localStorage.setItem("jwt", token);
+      navigate("/dashboard");
+    } catch (err) {
+      setError(err);
+    }
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-50">
+      <form onSubmit={handleSubmit} className="bg-white shadow-lg p-6 rounded-2xl w-80">
+        <h1 className="text-xl font-semibold mb-4">Login</h1>
+        <input
+          type="email"
+          placeholder="Email"
+          className="w-full border p-2 rounded mb-2"
+          value={form.email}
+          onChange={(e) => setForm({ ...form, email: e.target.value })}
+        />
+        <input
+          type="password"
+          placeholder="Password"
+          className="w-full border p-2 rounded mb-2"
+          value={form.password}
+          onChange={(e) => setForm({ ...form, password: e.target.value })}
+        />
+        {error && <p className="text-red-500 text-sm mb-2">{error}</p>}
+        <button type="submit" className="w-full bg-black text-white py-2 rounded">Login</button>
+      </form>
+    </div>
+  );
+}
+
+// -------------------------
+// Protected Route Component
+// -------------------------
+function ProtectedRoute({ children }) {
+  const token = localStorage.getItem("jwt");
+  if (!token || !verifyJWT(token)) {
+    return <Navigate to="/login" replace />;
+  }
+  return children;
+}
+
+// -------------------------
+// Dashboard Component
+// -------------------------
+function Dashboard() {
+  const navigate = useNavigate();
+  const [user, setUser] = useState(null);
+
+  useEffect(() => {
+    const token = localStorage.getItem("jwt");
+    if (token && verifyJWT(token)) {
+      const decoded = JSON.parse(atob(token));
+      setUser(decoded.email);
+    }
+  }, []);
+
+  function logout() {
+    localStorage.removeItem("jwt");
+    navigate("/login");
+  }
+
+  return (
+    <div className="min-h-screen flex flex-col items-center justify-center bg-gray-100">
+      <div className="bg-white p-6 rounded-2xl shadow-md text-center">
+        <h2 className="text-xl font-semibold mb-2">Welcome, {user || "User"}</h2>
+        <p className="text-gray-500 mb-4">This is a protected dashboard.</p>
+        <button onClick={logout} className="bg-red-500 text-white px-4 py-2 rounded">Logout</button>
+      </div>
+    </div>
+  );
+}
+
+// -------------------------
+// App Component
+// -------------------------
+export default function App() {
+  return (
+    <Router>
+      <Routes>
+        <Route path="/login" element={<Login />} />
+        <Route
+          path="/dashboard"
+          element={
+            <ProtectedRoute>
+              <Dashboard />
+            </ProtectedRoute>
+          }
+        />
+        <Route path="*" element={<Navigate to="/login" replace />} />
+      </Routes>
+    </Router>
+  );
+}
