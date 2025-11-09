@@ -1,0 +1,335 @@
+import { useEffect, useMemo, useState } from "react";
+import { BrowserRouter as Router, Routes, Route, Navigate, Link, useNavigate } from "react-router-dom";
+
+// =====================================================
+// JWT + RBAC Demo (Admin / Moderator / User)
+// Single-file React app with protected & role-guarded routes
+// =====================================================
+
+// -------------------------
+// Fake Auth / JWT helpers
+// -------------------------
+function fakeLoginAPI(email, password, role) {
+  return new Promise((resolve, reject) => {
+    setTimeout(() => {
+      // super basic demo check
+      if (!email || !password) return reject("Email & password required");
+      if (password !== "password123") return reject("Invalid credentials");
+
+      // payload with role & expiry (1 hour)
+      const payload = { email, role, exp: Date.now() + 60 * 60 * 1000 };
+      const token = btoa(JSON.stringify(payload));
+      resolve(token);
+    }, 600);
+  });
+}
+
+function decodeJWT(token) {
+  try {
+    return JSON.parse(atob(token));
+  } catch (_) {
+    return null;
+  }
+}
+
+function isTokenValid(token) {
+  const data = decodeJWT(token);
+  if (!data) return false;
+  return data.exp && data.exp > Date.now();
+}
+
+function getAuthData() {
+  const token = localStorage.getItem("jwt");
+  if (!token || !isTokenValid(token)) return null;
+  return decodeJWT(token);
+}
+
+function logoutNow() {
+  localStorage.removeItem("jwt");
+}
+
+// -------------------------
+// Small Auth Hook
+// -------------------------
+function useAuth() {
+  const [auth, setAuth] = useState(() => getAuthData());
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      // keep state in sync if token expires or changes from other tabs
+      const next = getAuthData();
+      setAuth((prev) => {
+        const same = JSON.stringify(prev) === JSON.stringify(next);
+        return same ? prev : next;
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  const isAuthenticated = !!auth;
+  const role = auth?.role ?? null;
+  const email = auth?.email ?? null;
+
+  return { isAuthenticated, role, email, auth };
+}
+
+// -------------------------
+// Route Guards
+// -------------------------
+function ProtectedRoute({ children }) {
+  const token = localStorage.getItem("jwt");
+  if (!token || !isTokenValid(token)) return <Navigate to="/login" replace />;
+  return children;
+}
+
+function RoleRoute({ children, allow = [] }) {
+  const token = localStorage.getItem("jwt");
+  if (!token || !isTokenValid(token)) return <Navigate to="/login" replace />;
+  const payload = decodeJWT(token);
+  const ok = allow.length === 0 || allow.includes(payload.role);
+  if (!ok) return <Navigate to="/403" replace />;
+  return children;
+}
+
+// -------------------------
+// UI: Shell & Nav
+// -------------------------
+function Shell({ children }) {
+  const { isAuthenticated, role, email } = useAuth();
+  const navigate = useNavigate();
+
+  function handleLogout() {
+    logoutNow();
+    navigate("/login");
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <header className="sticky top-0 bg-white/90 backdrop-blur border-b shadow-sm">
+        <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
+          <Link to="/" className="font-semibold">RBAC Demo</Link>
+          <nav className="flex items-center gap-3 text-sm">
+            <Link className="hover:underline" to="/dashboard">Dashboard</Link>
+            <Link className="hover:underline" to="/user">User</Link>
+            <Link className="hover:underline" to="/moderator">Moderator</Link>
+            <Link className="hover:underline" to="/admin">Admin</Link>
+          </nav>
+          <div className="flex items-center gap-3 text-sm">
+            {isAuthenticated ? (
+              <>
+                <span className="text-gray-600 hidden sm:inline">{email} · {role}</span>
+                <button onClick={handleLogout} className="rounded-xl bg-black text-white px-3 py-1.5">Logout</button>
+              </>
+            ) : (
+              <Link to="/login" className="rounded-xl bg-black text-white px-3 py-1.5">Login</Link>
+            )}
+          </div>
+        </div>
+      </header>
+      <main className="max-w-5xl mx-auto px-4 py-6">{children}</main>
+    </div>
+  );
+}
+
+// -------------------------
+// Pages
+// -------------------------
+function Home() {
+  return (
+    <div className="grid gap-4">
+      <h1 className="text-2xl font-semibold">Role-Based Access Control</h1>
+      <p className="text-gray-600">Use the top nav to try protected pages. Log in with any email and password <code>password123</code>. Choose a role at login to receive the right permissions.</p>
+    </div>
+  );
+}
+
+function Dashboard() {
+  const { email, role } = useAuth();
+  return (
+    <div className="bg-white p-6 rounded-2xl shadow">
+      <h2 className="text-xl font-semibold mb-2">Dashboard</h2>
+      <p className="text-gray-600">Welcome {email}! Your role is <span className="font-medium">{role}</span>.</p>
+    </div>
+  );
+}
+
+function UserPage() {
+  return (
+    <div className="bg-white p-6 rounded-2xl shadow">
+      <h2 className="text-xl font-semibold mb-2">User Area</h2>
+      <ul className="list-disc ml-6 text-gray-700">
+        <li>View your profile</li>
+        <li>Edit basic settings</li>
+      </ul>
+    </div>
+  );
+}
+
+function ModeratorPage() {
+  return (
+    <div className="bg-white p-6 rounded-2xl shadow">
+      <h2 className="text-xl font-semibold mb-2">Moderator Tools</h2>
+      <ul className="list-disc ml-6 text-gray-700">
+        <li>Review reports</li>
+        <li>Manage posts & comments</li>
+      </ul>
+    </div>
+  );
+}
+
+function AdminPage() {
+  return (
+    <div className="bg-white p-6 rounded-2xl shadow">
+      <h2 className="text-xl font-semibold mb-2">Admin Console</h2>
+      <ul className="list-disc ml-6 text-gray-700">
+        <li>Manage users & roles</li>
+        <li>System settings</li>
+        <li>Audit logs</li>
+      </ul>
+    </div>
+  );
+}
+
+function NotAuthorized() {
+  return (
+    <div className="text-center bg-white p-8 rounded-2xl shadow">
+      <h2 className="text-2xl font-semibold mb-2">403 · Not authorized</h2>
+      <p className="text-gray-600">You don't have permission to view this page.</p>
+      <div className="mt-4">
+        <Link to="/" className="underline">Go home</Link>
+      </div>
+    </div>
+  );
+}
+
+// -------------------------
+// Login w/ Role Selection
+// -------------------------
+function Login() {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [role, setRole] = useState("User"); // User | Moderator | Admin
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const navigate = useNavigate();
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setError("");
+    setLoading(true);
+    try {
+      const token = await fakeLoginAPI(email, password, role);
+      localStorage.setItem("jwt", token);
+      navigate("/dashboard");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="max-w-md mx-auto">
+      <div className="bg-white p-6 rounded-2xl shadow">
+        <h1 className="text-xl font-semibold mb-4">Login</h1>
+        <form onSubmit={handleSubmit} className="space-y-3">
+          <div>
+            <label className="block text-sm mb-1">Email</label>
+            <input
+              type="email"
+              className="w-full border rounded-xl px-3 py-2"
+              placeholder="you@example.com"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="block text-sm mb-1">Password</label>
+            <input
+              type="password"
+              className="w-full border rounded-xl px-3 py-2"
+              placeholder="password123"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="block text-sm mb-1">Role</label>
+            <select
+              className="w-full border rounded-xl px-3 py-2 bg-white"
+              value={role}
+              onChange={(e) => setRole(e.target.value)}
+            >
+              <option>User</option>
+              <option>Moderator</option>
+              <option>Admin</option>
+            </select>
+          </div>
+          {error && <p className="text-red-600 text-sm">{error}</p>}
+          <button
+            disabled={loading}
+            className="w-full rounded-xl bg-black text-white py-2 disabled:opacity-50"
+          >
+            {loading ? "Signing in…" : "Sign in"}
+          </button>
+        </form>
+        <p className="text-xs text-gray-500 mt-3">Hint: any email works, password must be <code>password123</code>. Choose a role to test RBAC.</p>
+      </div>
+    </div>
+  );
+}
+
+// -------------------------
+// App (Routes)
+// -------------------------
+export default function App() {
+  return (
+    <Router>
+      <Shell>
+        <Routes>
+          <Route path="/" element={<Home />} />
+          <Route path="/login" element={<Login />} />
+
+          {/* Any authenticated user */}
+          <Route
+            path="/dashboard"
+            element={
+              <ProtectedRoute>
+                <Dashboard />
+              </ProtectedRoute>
+            }
+          />
+
+          {/* Role-guarded examples */}
+          <Route
+            path="/user"
+            element={
+              <RoleRoute allow={["User", "Moderator", "Admin"]}>
+                <UserPage />
+              </RoleRoute>
+            }
+          />
+          <Route
+            path="/moderator"
+            element={
+              <RoleRoute allow={["Moderator", "Admin"]}>
+                <ModeratorPage />
+              </RoleRoute>
+            }
+          />
+          <Route
+            path="/admin"
+            element={
+              <RoleRoute allow={["Admin"]}>
+                <AdminPage />
+              </RoleRoute>
+            }
+          />
+
+          <Route path="/403" element={<NotAuthorized />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </Shell>
+    </Router>
+  );
+}
